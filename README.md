@@ -17,10 +17,11 @@
 5. [操作說明](#操作說明)
 6. [取樣策略：不同 Time/div 怎麼取樣](#取樣策略不同-timediv-怎麼取樣)
 7. [系統架構](#系統架構)
-8. [規格與限制](#規格與限制)
-9. [校正](#校正)
-10. [疑難排解](#疑難排解)
-11. [版本沿革與後續規劃](#版本沿革與後續規劃)
+8. [程式架構（給初學者）](#程式架構給初學者)
+9. [規格與限制](#規格與限制)
+10. [校正](#校正)
+11. [疑難排解](#疑難排解)
+12. [版本沿革與後續規劃](#版本沿革與後續規劃)
 
 ---
 
@@ -236,6 +237,219 @@ flowchart LR
 - 完全不需要外部函式庫。
 - 在舊與新的 ESP8266 核心都能編譯。
 - 代價是更新率較低（DEMO 實測約 12 fps）。
+
+---
+
+## 程式架構（給初學者）
+
+這一章帶你從「整體概念」一路看到「想改東西該改哪裡」。建議照順序讀。
+
+### 1. 先建立整體概念
+
+整個專案只有一個 `.ino` 檔，但裡面其實藏著**兩個程式**：
+
+| | 韌體（C++） | 網頁（HTML + CSS + JavaScript） |
+|---|---|---|
+| 在哪裡執行 | **ESP8266** 上 | **手機或電腦的瀏覽器**裡 |
+| 程式碼在哪 | `.ino` 檔案的大部分區域 | 一大段文字 `INDEX_HTML`（`R"=====(` 到 `)====="` 之間） |
+| 負責什麼 | 發 WiFi、讀取訊號、回應瀏覽器 | 換算電壓、找觸發點、量測、畫示波器畫面、處理按鈕 |
+
+ESP 對網頁只做一件事：瀏覽器來要的時候，**原封不動把那段文字送出去**。ESP 自己不會執行它。
+
+**為什麼這樣分工？** ESP8266 的運算力和記憶體很小，而手機、電腦的瀏覽器很強。所以 ESP 只做「取樣與傳送」，繁重的計算和繪圖都交給瀏覽器。
+
+**另一個重要原則：瀏覽器主動來拿，ESP 不主動推。** 瀏覽器每隔一小段時間問 ESP：「有新資料嗎？」，有就拿走，沒有就等下一次。
+
+```mermaid
+flowchart LR
+    subgraph ESP["ESP8266：只負責取樣與傳送"]
+        A["讀取訊號"] --> B["放進緩衝區"]
+    end
+    subgraph WEB["瀏覽器：負責運算與顯示"]
+        C["換算成電壓"] --> D["找觸發點"] --> E["量測"] --> F["畫在螢幕上"]
+    end
+    B -- "瀏覽器來拿" --> C
+```
+
+### 2. `.ino` 檔案由上到下的內容
+
+| 順序 | 區塊 | 內容 |
+|---|---|---|
+| 1 | 檔頭註解 | 專案說明與通訊協定摘要 |
+| 2 | `#include` | 引入內建函式庫：WiFi、網頁伺服器、DNS 伺服器 |
+| 3 | `user settings` | 可調整的設定：`AP_SSID`、`AP_PASS`、`AP_CHANNEL`、`N_SAMPLES`（每次取樣點數）、取樣率上限 |
+| 4 | `globals` | 全域變數：伺服器物件、取樣緩衝區、各種狀態旗標 |
+| 5 | `INDEX_HTML` | **網頁本體**，檔案中最長的一段。裡面又分 `<style>`（CSS 外觀）、HTML 結構、`<script>`（JavaScript 邏輯） |
+| 6 | 擷取狀態與工具函式 | 擷取相關變數、`storeFrame()` 等 |
+| 7 | demo signal | `waveAt()`、`toRaw()`、`demoStep()`：產生模擬波形 |
+| 8 | roll mode | `rollStep()`：慢速檔位的連續取樣 |
+| 9 | real ADC | `adcBurst()`、`adcStep()`：讀取真實 A0 |
+| 10 | commands | `resetAcq()`、`applyCmd()`：解讀瀏覽器傳來的指令 |
+| 11 | http | `handleRoot()`、`handleData()`、`handleCmd()`、`handleNotFound()`：回應各個網址 |
+| 12 | `setup()` / `loop()` | 程式的起點與主迴圈 |
+
+> **Arduino 的規則**：`setup()` 在開機時執行**一次**，`loop()` 之後**不斷重複執行**。
+
+### 3. 韌體的運作：`setup()` 與 `loop()`
+
+**`setup()` 做的事（只跑一次）：**
+
+1. 開啟序列埠（115200），把 CPU 設成 160 MHz。
+2. 把 ESP 設成 **WiFi AP 模式**，IP 固定為 `192.168.4.1`。
+3. 登記網址對應的處理函式：
+   - `/` → `handleRoot()`（送出示波器網頁）
+   - `/d` → `handleData()`（給資料）
+   - `/c` → `handleCmd()`（收指令）
+   - 其他任何網址 → `handleNotFound()`（導回示波器頁面，這是自動彈出的關鍵）
+4. 啟動 HTTP 伺服器（連接埠 80）與 DNS 伺服器（連接埠 53）。
+
+**`loop()` 做的事（不斷重複）：**
+
+```mermaid
+flowchart TD
+    A["loop() 不斷重複"] --> B["dnsServer.processNextRequest()<br/>處理 DNS 查詢"]
+    B --> C["server.handleClient()<br/>處理 HTTP 請求"]
+    C --> D{"正在 Run，且 2 秒內<br/>瀏覽器有來拿資料？"}
+    D -- "否" --> A
+    D -- "是" --> E{"rollMode？<br/>（慢速檔位）"}
+    E -- "是" --> F["rollStep()<br/>連續取樣"]
+    E -- "否" --> G{"demoMode？"}
+    G -- "是" --> H["demoStep()<br/>產生模擬波形"]
+    G -- "否" --> I["adcStep()<br/>讀取 A0"]
+    F --> A
+    H --> A
+    I --> A
+```
+
+> **`loop()` 要跑得快。** ESP8266 的 WiFi 要靠 `loop()` 一直有空檔才能運作，所以程式盡量不長時間卡住。唯一的例外是 A0 的 burst 擷取，每次最多阻塞約 0.3 秒。
+
+### 4. 韌體的重要變數
+
+| 變數 | 意義 |
+|---|---|
+| `sampleBuf` | **取樣緩衝區**：存放 1024 個取樣值（`uint16_t`） |
+| `txBuf` | **傳送緩衝區**：前面 8 個位元組是檔頭（取樣率、類型），後面是資料 |
+| `frameReady` | 旗標：`true` 代表有一張新畫面等著被瀏覽器取走 |
+| `running` | 目前是 Run（`true`）還是 Stop（`false`） |
+| `demoMode` | `true` 為模擬波形，`false` 為真實 A0 |
+| `fsReq` | 瀏覽器要求的取樣率 |
+| `capLen` | 瀏覽器要求的「每張畫面要擷取幾點」 |
+| `rollMode` | 是否為慢速連續捲動模式 |
+| `lastPollMs` | 瀏覽器上一次來拿資料的時間，超過 2 秒沒來，ESP 就暫停取樣省資源 |
+
+### 5. 網頁（前端）的結構
+
+網頁的 JavaScript 放在 `<script>` 裡，由上到下分成幾個區塊：
+
+| 區塊 | 主要函式 | 說明 |
+|---|---|---|
+| 常數與狀態 | `st` 物件 | 儲存所有設定（見下表） |
+| 格式化 | `eng()` | 把數字轉成 `500 mV`、`1.5 kHz` 這種工程單位 |
+| 取樣設定 | `expectedFs()`、`expectedLen()`、`isRoll()`、`trigWide()` | 依 Time/div 決定要向 ESP 要求的取樣率與長度 |
+| 通訊 | `send()`、`pump()`、`syncState()`、`poll()`、`onFrame()` | 指令佇列、定時輪詢、收資料 |
+| ROLL 模式 | `pushRoll()`、`processRoll()`、`tick()` | 慢速檔位的平滑捲動 |
+| 訊號處理 | `toVolts()`、`findTrigger()`、`measure()`、`process()` | 數值換算、找觸發點、計算 Vpp/頻率等 |
+| 更新介面 | `updateMeas()`、`updateHeader()`、`updateControls()` | 把狀態顯示到文字與按鈕上 |
+| 繪圖 | `layout()`、`draw()` | 在 Canvas 上畫格線、波形、刻度與標記 |
+| 控制 | `setRun()`、`autoScale()`、`onV()`、`onT()`、各按鈕的事件 | 處理使用者操作 |
+
+**`st` 物件：前端的「設定總表」**
+
+| 欄位 | 意義 |
+|---|---|
+| `run` | `'run'`、`'stop'` 或 `'single'` |
+| `trigMode` | `'auto'` 或 `'normal'` |
+| `slope` | 觸發方向（`1` 上升、`-1` 下降） |
+| `trigV` | 觸發準位（伏特） |
+| `vIdx`、`tIdx` | 目前選到第幾檔 V/div、Time/div（對應 `VDIVS`、`TDIVS` 陣列） |
+| `pos`、`hpos` | 垂直位置、水平位置 |
+| `cpl`、`probe` | 耦合方式（DC/AC）、探棒倍率 |
+| `src` | 資料來源（`'demo'` 或 `'adc'`） |
+
+**前端的核心做法：**畫面完全由 `st`（設定）加上最近收到的資料決定。使用者改任何設定，流程都是：
+
+> 改 `st` → 呼叫 `refresh()` 重新處理資料 → `draw()` 重畫畫面
+
+所以你想知道「為什麼畫面長這樣」，只要看 `st` 的內容與 `draw()` 即可。
+
+### 6. 一張畫面的旅程（資料如何流動）
+
+```mermaid
+sequenceDiagram
+    participant B as 瀏覽器 JS
+    participant E as ESP8266 C++
+    B->>E: GET /c?c=a:20000,1024,0 （設定取樣）
+    E-->>B: ok
+    loop 每隔幾十毫秒
+        B->>E: GET /d
+        alt 還沒有新資料
+            E-->>B: 204 無內容
+        else 一張畫面準備好了
+            E-->>B: 200 加上二進位資料
+            Note over B: onFrame 然後 process 然後 draw
+        end
+    end
+    Note over E: loop 裡的 demoStep 或 adcStep 在背景填好 sampleBuf
+```
+
+逐步說明：
+
+1. **ESP 取樣**：`loop()` 呼叫 `demoStep()` 或 `adcStep()`，把取樣值填進 `sampleBuf`。
+2. **打包**：`storeFrame()` 把取樣率、類型與取樣值複製到 `txBuf`，並設 `frameReady = true`。
+3. **瀏覽器來拿**：`poll()` 向 `/d` 要資料。有新畫面時 `handleData()` 回傳 `txBuf`，沒有就回 204。
+4. **解析**：`onFrame()` 把收到的位元組還原成數字陣列。
+5. **換算**：`toVolts()` 把 0 ～ 1023 的原始值換成電壓（乘上滿量程與探棒倍率，AC 耦合則扣掉平均值）。
+6. **找觸發點**：`findTrigger()` 在資料中找出訊號穿過觸發準位的位置，決定波形從哪裡開始畫。
+7. **量測**：`measure()` 算出 Vpp、Vmax、Vmin、Vavg、Vrms 與頻率。
+8. **畫圖**：`draw()` 畫出格線、波形、刻度與標記。
+
+### 7. 範例：按下 Time/div 的「＋」會發生什麼事？
+
+1. `onT(1)` 被呼叫，`st.tIdx` 加 1。
+2. `clampT()` 確認這一檔沒有超出 ADC 能做到的範圍。
+3. `modeSwitch()` 判斷是否跨越了「觸發擷取」與「ROLL」的界線，必要時清掉舊資料。
+4. `sendFs()` 算出新的取樣率與擷取長度，用 `send('a:取樣率,長度,roll')` 放進指令佇列。
+5. `pump()` 透過 `GET /c?c=...` 把指令送給 ESP；失敗會自動重送。
+6. ESP 的 `handleCmd()` 呼叫 `applyCmd()`，更新 `fsReq`、`capLen`、`rollMode`，並用 `resetAcq()` 清掉舊的擷取。
+7. 下一張畫面就以新的取樣率送回來，`process()` 與 `draw()` 依新的 Time/div 重畫。同時 `updateControls()` 更新面板上的數字。
+
+### 8. 想修改？從哪裡下手
+
+| 想做的事 | 修改位置 |
+|---|---|
+| 改 WiFi 名稱與密碼 | `.ino` 上方的 `AP_SSID`、`AP_PASS` |
+| 改慢速（ROLL）的切換門檻 | JavaScript 的 `ROLL_MIN_T`（`0.02` 代表 20 ms/div） |
+| 改每格取樣點數 | JavaScript 的 `PTS`、`PTS_ROLL`、`PTS_TRIG` |
+| 增減 V/div、Time/div 檔位 | JavaScript 的 `VDIVS`、`TDIVS` 陣列 |
+| 改 A0 滿量程預設值 | JavaScript 的 `vrefAdc`（預設 `3.2`） |
+| 改 A0 取樣率上限 | 按 ADC TEST 會自動更新；預設值在 `.ino` 的 `fsMaxAdc` 與 JavaScript 的 `FS_MAX` |
+| 改波形顏色 | CSS 與 `draw()` 裡的 `#ffd400`（黃色），可用編輯器的「取代」一次改完 |
+| 改版面與按鈕 | `INDEX_HTML` 內的 HTML 與 CSS |
+| 新增一個控制指令 | 前端用 `send('指令')`，在 `.ino` 的 `applyCmd()` 加一個對應的判斷 |
+| 加大取樣點數 | 改 `N_SAMPLES`，並同步修改 JavaScript `expectedLen()` 裡的 `1024`。要留意 ESP8266 的記憶體有限，點數太大可能不穩定 |
+
+> 修改 `INDEX_HTML` 時要小心：它是 C++ 的一個長字串，內容不能出現 `)=====";` 這串字元，否則會提早結束。
+
+### 9. 建議的閱讀順序
+
+1. `setup()` 與 `loop()`：看懂程式的骨架。
+2. `handleData()` 與 `handleCmd()`：看懂瀏覽器如何跟 ESP 溝通。
+3. `demoStep()`：看懂取樣值怎麼被產生。
+4. 網頁的 `poll()` 與 `onFrame()`，再看 `process()`：看懂資料如何被處理。
+5. `draw()`：看懂畫面如何被畫出來。
+
+### 10. 名詞小辭典
+
+| 名詞 | 意思 |
+|---|---|
+| **AP（Access Point）** | ESP 自己當 WiFi 基地台，讓手機、電腦連進來 |
+| **輪詢（Polling）** | 用戶端每隔一段時間主動去問「有新資料嗎？」 |
+| **緩衝區（Buffer）** | 暫時存放資料的記憶體空間 |
+| **取樣率（Fs）** | 每秒讀取幾次訊號，單位 Sa/s |
+| **ADC** | 類比數位轉換器，把電壓轉成數字（本專案是 0 ～ 1023） |
+| **Captive Portal** | 連上 WiFi 後自動彈出登入頁的機制，這裡用來自動開啟示波器 |
+| **Canvas** | 瀏覽器內可以用程式畫圖的區域，示波器畫面就畫在上面 |
+| **觸發（Trigger）** | 讓每次畫面的波形都從相同位置開始，看起來才會穩定 |
 
 ---
 
